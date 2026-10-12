@@ -24,11 +24,10 @@ jobs:
           distribution: temurin
           java-version: 17
 
-      - uses: android-actions/setup-android@v3
-
       - name: Install NDK required by J2ME Loader
         working-directory: loader
         run: |
+          yes | sdkmanager --licenses > /dev/null || true
           NDK=$(grep -E '^NDK_VERSION' gradle.properties | cut -d= -f2 | tr -d ' ')
           echo "NDK $NDK"
           yes | sdkmanager "ndk;$NDK" || true
