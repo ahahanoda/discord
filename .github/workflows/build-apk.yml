@@ -1,1 +1,89 @@
+name: Build standalone APK
 
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      # 1) このリポジトリ (discord_jl.jar をルートに置く)
+      - uses: actions/checkout@v4
+
+      # 2) J2ME Loader 本体のソース
+      - uses: actions/checkout@v4
+        with:
+          repository: nikita36078/J2ME-Loader
+          path: loader
+          submodules: recursive
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: android-actions/setup-android@v3
+
+      - name: Install NDK required by J2ME Loader
+        working-directory: loader
+        run: |
+          NDK=$(grep -E '^NDK_VERSION' gradle.properties | cut -d= -f2 | tr -d ' ')
+          echo "NDK $NDK"
+          yes | sdkmanager "ndk;$NDK" || true
+
+      # 3) jar を J2ME Loader の "midlet" フレーバーに流し込む
+      - name: Embed discord_jl.jar as MIDlet
+        run: |
+          JAR="$GITHUB_WORKSPACE/discord_jl.jar"
+          RES=loader/app/src/midlet/resources
+          mkdir -p "$RES/MIDLET-META-INF" loader/app/libs
+
+          # 画像・json などのリソース (class と META-INF 以外)
+          unzip -o -q "$JAR" -x '*.class' 'META-INF/*' -d "$RES"
+
+          # MIDlet マニフェスト
+          unzip -p "$JAR" META-INF/MANIFEST.MF > "$RES/MIDLET-META-INF/MANIFEST.MF"
+
+          # class だけの jar を作る
+          cp "$JAR" loader/app/libs/midlet-classes.jar
+          unzip -Z1 "$JAR" | grep -v '\.class$' | while IFS= read -r f; do
+            zip -q -d loader/app/libs/midlet-classes.jar "$f" || true
+          done
+
+          cat >> loader/app/build.gradle <<'GRADLE'
+
+          dependencies {
+              midletImplementation files('libs/midlet-classes.jar')
+          }
+          GRADLE
+          # heredoc のインデントを除去
+          sed -i 's/^          //' loader/app/build.gradle
+
+          echo "--- midlet source set ---"
+          find loader/app/src/midlet -maxdepth 3 | head -50
+          cat "$RES/MIDLET-META-INF/MANIFEST.MF"
+
+      # 4) release 署名設定が読み込み時に要求するダミー
+      - name: Dummy keystore.properties
+        working-directory: loader
+        run: |
+          cat > keystore.properties <<'EOP'
+          keyAlias=dummy
+          keyPassword=dummy
+          storeFile=dummy.jks
+          storePassword=dummy
+          EOP
+          sed -i 's/^          //' keystore.properties
+
+      - name: Build
+        working-directory: loader
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleMidletDebug --no-daemon --stacktrace
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Discord-apk
+          path: loader/app/build/outputs/apk/midlet/debug/*.apk
