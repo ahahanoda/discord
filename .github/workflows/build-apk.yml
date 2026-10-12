@@ -1,4 +1,4 @@
-name: Build standalone APK
+name: Build APK (Android 2.3 backport)
 
 on:
   push:
@@ -9,80 +9,86 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      # 1) このリポジトリ (discord_jl.jar をルートに置く)
+      # 1) このリポジトリ (discord_jl.jar を置く)
       - uses: actions/checkout@v4
 
-      # 2) J2ME Loader 本体のソース
+      # 2) Android 2.3 (API 10) 向け J2ME Loader バックポート
       - uses: actions/checkout@v4
         with:
-          repository: nikita36078/J2ME-Loader
+          repository: revgato/J2ME-Loader-backport-android-2.3
           path: loader
-          submodules: recursive
 
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: 17
 
-      - name: Install NDK required by J2ME Loader
+      - name: Accept SDK licenses
+        run: yes | sdkmanager --licenses > /dev/null || true
+
+      - name: Show build config
         working-directory: loader
         run: |
-          yes | sdkmanager --licenses > /dev/null || true
-          NDK=$(grep -E '^NDK_VERSION' gradle.properties | cut -d= -f2 | tr -d ' ')
-          echo "NDK $NDK"
-          yes | sdkmanager "ndk;$NDK" || true
+          grep -nE "minSdk|targetSdk|midlet" app/build.gradle || true
+          ls app/src
 
-      # 3) jar を J2ME Loader の "midlet" フレーバーに流し込む
-      - name: Embed discord_jl.jar as MIDlet
+      - name: Find jar
+        id: jar
         run: |
-          JAR="$GITHUB_WORKSPACE/discord_jl.jar"
-          RES=loader/app/src/midlet/resources
-          mkdir -p "$RES/MIDLET-META-INF" loader/app/libs
+          JAR=$(find "$GITHUB_WORKSPACE" -path "$GITHUB_WORKSPACE/loader" -prune -o -iname '*.jar' -print | head -n1)
+          if [ -z "$JAR" ]; then
+            echo "::error::リポジトリ内に .jar が見つかりません。discord_jl.jar をコミットしてください"
+            exit 1
+          fi
+          echo "path=$JAR" >> "$GITHUB_OUTPUT"
 
-          # 画像・json などのリソース (class と META-INF 以外)
-          unzip -o -q "$JAR" -x '*.class' 'META-INF/*' -d "$RES"
+      # 3) midlet ビルド設定があれば jar を埋め込む (単体APK)
+      - name: Embed jar as MIDlet (if supported)
+        id: embed
+        run: |
+          JAR="${{ steps.jar.outputs.path }}"
+          if grep -q "midlet" loader/app/build.gradle; then
+            RES=loader/app/src/midlet/resources
+            mkdir -p "$RES/MIDLET-META-INF" loader/app/libs
+            unzip -o -q "$JAR" -x '*.class' 'META-INF/*' -d "$RES"
+            unzip -p "$JAR" META-INF/MANIFEST.MF > "$RES/MIDLET-META-INF/MANIFEST.MF"
+            cp "$JAR" loader/app/libs/midlet-classes.jar
+            unzip -Z1 "$JAR" | grep -v '\.class$' | while IFS= read -r f; do
+              zip -q -d loader/app/libs/midlet-classes.jar "$f" || true
+            done
+            printf '\ndependencies {\n    midletImplementation files("libs/midlet-classes.jar")\n}\n' >> loader/app/build.gradle
+            printf 'keyAlias=dummy\nkeyPassword=dummy\nstoreFile=dummy.jks\nstorePassword=dummy\n' > loader/keystore.properties
+            echo "mode=midlet" >> "$GITHUB_OUTPUT"
+          else
+            echo "mode=loader" >> "$GITHUB_OUTPUT"
+          fi
 
-          # MIDlet マニフェスト
-          unzip -p "$JAR" META-INF/MANIFEST.MF > "$RES/MIDLET-META-INF/MANIFEST.MF"
-
-          # class だけの jar を作る
-          cp "$JAR" loader/app/libs/midlet-classes.jar
-          unzip -Z1 "$JAR" | grep -v '\.class$' | while IFS= read -r f; do
-            zip -q -d loader/app/libs/midlet-classes.jar "$f" || true
-          done
-
-          cat >> loader/app/build.gradle <<'GRADLE'
-
-          dependencies {
-              midletImplementation files('libs/midlet-classes.jar')
-          }
-          GRADLE
-          # heredoc のインデントを除去
-          sed -i 's/^          //' loader/app/build.gradle
-
-          echo "--- midlet source set ---"
-          find loader/app/src/midlet -maxdepth 3 | head -50
-          cat "$RES/MIDLET-META-INF/MANIFEST.MF"
-
-      # 4) release 署名設定が読み込み時に要求するダミー
-      - name: Dummy keystore.properties
+      - name: Build (standalone midlet APK)
+        if: steps.embed.outputs.mode == 'midlet'
         working-directory: loader
-        run: |
-          cat > keystore.properties <<'EOP'
-          keyAlias=dummy
-          keyPassword=dummy
-          storeFile=dummy.jks
-          storePassword=dummy
-          EOP
-          sed -i 's/^          //' keystore.properties
+        run: sh gradlew assembleMidletDebug --no-daemon --stacktrace
 
-      - name: Build
+      - name: Build (loader APK for Android 2.3)
+        if: steps.embed.outputs.mode == 'loader'
         working-directory: loader
+        run: sh gradlew assembleRelease --no-daemon --stacktrace
+
+      - name: Collect outputs
         run: |
-          chmod +x gradlew
-          ./gradlew assembleMidletDebug --no-daemon --stacktrace
+          mkdir -p out
+          find loader/app/build/outputs/apk -name '*.apk' -exec cp {} out/ \;
+          if [ "${{ steps.embed.outputs.mode }}" = "loader" ]; then
+            cp "${{ steps.jar.outputs.path }}" out/
+            cat > out/README.txt <<'EOT'
+          This backport has no standalone (midlet) build mode.
+          1) adb install -r J2ME-Loader-*.apk
+          2) copy the jar to /sdcard/J2ME-Loader/incoming/ on the device
+          3) open the app -> Install JAR/JAD -> pick the jar
+          EOT
+          fi
+          ls -la out
 
       - uses: actions/upload-artifact@v4
         with:
-          name: Discord-apk
-          path: loader/app/build/outputs/apk/midlet/debug/*.apk
+          name: Discord-apk-android2.3
+          path: out/
